@@ -154,7 +154,7 @@ def generer_planning():
             programmes_charges[prog_id] = pd.DataFrame()
 
     # --- Remplissage des messages, format, url ---
-    type_mapping = {"Conseil": "2-Conseil", "Aphorisme": "1-Aphorisme", "Réflexion": "3-Réflexion"}
+    type_mapping = {"Aphorisme": "1-Aphorisme", "Conseil": "2-Conseil", "Réflexion": "3-Réflexion"}
     messages_remplis, formats_remplis, urls_remplis = [], [], []
     for _, row in df_merge.iterrows():
         if pd.notna(row["message"]) and row["message"].strip() != "":
