@@ -2,23 +2,9 @@ import gspread
 from google.oauth2.service_account import Credentials
 import pandas as pd
 from datetime import datetime, timedelta
-import pytz
-import unicodedata
+from collections import defaultdict
 import config
-
-# ==== Configuration columns (strict headers) ====
-CLIENTS_COLS = [
-    "Client", "Thème", "Canal ID", "Programme", "Saison",
-    "Date de Démarrage", "Jours de Diffusion",
-    "Heure Conseil", "Heure Aphorisme", "Heure Réflexion",
-]
-
-PLANNING_COLS = [
-    "client","programme","saison","chat_id","date","heure",
-    "type","avancement","message","format","url","envoye",
-]
-
-PROGRAMME_COLS = ["Support","Saison","Jour","Type","Phrase","Format","Url"]
+import pytz
 
 def _tz():
     try:
@@ -26,268 +12,279 @@ def _tz():
     except Exception:
         return pytz.timezone("Europe/Paris")
 
-def _to_time_hms(val):
+def _parse_jours_diffusion(x):
+    # accepte 'Lundi, Mardi' ou liste déjà splittée
+    if isinstance(x, list):
+        vals = x
+    else:
+        vals = str(x).replace(";", ",").split(",")
+    return [j.strip().lower() for j in vals if str(j).strip() != ""]
+
+def _normalize_hms(val):
+    """Retourne HH:MM:SS ou '' si invalide"""
     if pd.isna(val) or str(val).strip() == "":
         return ""
     s = str(val).strip()
-    # normalize common variations
-    s = s.replace("h", ":").replace("H", ":").replace(" ", "")
-    s = s.replace(".", ":")
-    # try several formats
-    for fmt in ("%H:%M:%S","%H:%M"):
+    # Essayes formats communs
+    for fmt in ("%H:%M:%S", "%H:%M"):
         try:
             t = pd.to_datetime(s, format=fmt).time()
             return t.strftime("%H:%M:%S")
         except Exception:
             pass
+    # fallback parsing pandas
     try:
         t = pd.to_datetime(s).time()
         return t.strftime("%H:%M:%S")
     except Exception:
         return ""
 
-def _weekday_fr(dt_date):
+def _compute_avancement(date_debut_local_date, date_envoi_local_date, jours_diff_lc):
+    """Compte uniquement les jours de diffusion entre date_debut (incluse) et date_envoi (incluse)."""
+    if not jours_diff_lc:
+        # diffusion quotidienne
+        return (date_envoi_local_date - date_debut_local_date).days + 1
     jours = ["lundi","mardi","mercredi","jeudi","vendredi","samedi","dimanche"]
-    return jours[dt_date.weekday()]
-
-def _parse_jours_diffusion(s):
-    if pd.isna(s): return set()
-    txt = str(s)
-    # If Google Sheets multi-select chips come as comma-separated labels
-    txt = txt.replace(";", ",")
-    parts = [p.strip().lower() for p in txt.split(",") if p.strip()]
-    # normalize potential English weekday names
-    map_en = {
-        "monday":"lundi","tuesday":"mardi","wednesday":"mercredi",
-        "thursday":"jeudi","friday":"vendredi","saturday":"samedi","sunday":"dimanche"
-    }
-    out = []
-    for p in parts:
-        out.append(map_en.get(p, p))
-    return set(out)
-
-def _normalize(s):
-    # lowercase, strip accents
-    s = str(s)
-    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
-    return s.lower().strip()
-
-def _type_candidates(local_type):
-    # Accept both plain labels and numbered labels (1-Aphorisme, 2-Conseil, 3-Réflexion)
-    base = local_type
-    if base.lower() == "réflexion":
-        base_alt = "Reflexion"
-    else:
-        base_alt = base
-    mapping_num = {"Aphorisme":"1","Conseil":"2","Réflexion":"3","Reflexion":"3"}
-    num = mapping_num.get(base, mapping_num.get(base_alt, ""))
-    cands = [base, base_alt, base.lower(), base_alt.lower()]
-    if num:
-        cands += [f"{num}-{base}", f"{num} - {base}", f"{num}-{base_alt}", f"{num} - {base_alt}",
-                  f"{num}-{base.lower()}", f"{num}-{base_alt.lower()}"]
-    return list(dict.fromkeys(cands))  # unique, keep order
+    count = 0
+    cur = date_debut_local_date
+    while cur <= date_envoi_local_date:
+        if jours[cur.weekday()] in jours_diff_lc:
+            count += 1
+        cur += timedelta(days=1)
+    return count
 
 def generer_planning():
     tz = _tz()
-    NB_JOURS = getattr(config, "NB_JOURS_GENERATION", 2)
-    RETENTION = getattr(config, "RETENTION_JOURS", 2)
 
-    scope = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
+    # --- Authentification Google Sheets ---
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive"
+    ]
     creds = Credentials.from_service_account_file(config.CHEMIN_CLE_JSON, scopes=scope)
-    gc = gspread.authorize(creds)
+    client_gsheets = gspread.authorize(creds)
 
-    ws_clients = gc.open(config.FICHIER_CLIENTS).worksheet(config.FEUILLE_CLIENTS)
-    ws_planning = gc.open(config.FICHIER_PLANNING).worksheet(config.FEUILLE_PLANNING)
+    # --- Dictionnaire jours FR ---
+    jours_fr = {
+        "monday": "lundi", "tuesday": "mardi", "wednesday": "mercredi",
+        "thursday": "jeudi", "friday": "vendredi", "saturday": "samedi", "sunday": "dimanche"
+    }
+    def jour_fr(dt):
+        return jours_fr[dt.strftime("%A").lower()]
 
-    dfc = pd.DataFrame(ws_clients.get_all_records())
-    for c in CLIENTS_COLS:
-        if c not in dfc.columns: dfc[c] = ""
+    # --- Lecture fichier clients ---
+    ws_clients = client_gsheets.open(config.FICHIER_CLIENTS).worksheet(config.FEUILLE_CLIENTS)
+    df_clients = pd.DataFrame(ws_clients.get_all_records())
 
-    # normalize fields
-    dfc["Programme"] = dfc["Programme"].apply(lambda x: str(x).zfill(3))
-    dfc["Saison"] = pd.to_numeric(dfc["Saison"], errors="coerce").fillna(1).astype(int)
-    # dayfirst per user locale JJ/MM/AAAA
-    dfc["Date de Démarrage"] = pd.to_datetime(dfc["Date de Démarrage"], errors="coerce", dayfirst=True).dt.date
-    for h in ["Heure Conseil","Heure Aphorisme","Heure Réflexion"]:
-        dfc[h] = dfc[h].apply(_to_time_hms)
-    dfc["jours_set"] = dfc["Jours de Diffusion"].apply(_parse_jours_diffusion)
+    # --- Préparation ---
+    # Dates: dayfirst=True pour JJ/MM/AAAA
+    df_clients["Date de Démarrage"] = pd.to_datetime(df_clients["Date de Démarrage"], errors="coerce", dayfirst=True)
+    # Jours de diffusion
+    df_clients["Jours de Diffusion"] = df_clients["Jours de Diffusion"].apply(_parse_jours_diffusion)
+    # Programme/Saison/Canal
+    df_clients["Programme"] = df_clients["Programme"].astype(int).apply(lambda x: f"{x:03}")
+    df_clients["Canal ID"] = df_clients["Canal ID"].astype(str)
+    df_clients["Saison"] = df_clients["Saison"].astype(int)
 
-    today = datetime.now(tz).date()
-    dates_fenetre = [today + timedelta(days=i) for i in range(NB_JOURS)]
+    colonnes_utiles = [
+        "Client", "Thème", "Canal ID", "Programme", "Saison",
+        "Date de Démarrage", "Jours de Diffusion", "Heure Conseil",
+        "Heure Aphorisme", "Heure Réflexion"
+    ]
+    # sécurité si colonnes manquantes
+    for c in colonnes_utiles:
+        if c not in df_clients.columns:
+            df_clients[c] = ""
+    df_filtree = df_clients[colonnes_utiles].copy()
 
-    type_to_hourcol = {"Conseil":"Heure Conseil","Aphorisme":"Heure Aphorisme","Réflexion":"Heure Réflexion"}
+    # Normaliser heures -> HH:MM:SS
+    for hcol in ["Heure Conseil","Heure Aphorisme","Heure Réflexion"]:
+        df_filtree[hcol] = df_filtree[hcol].apply(_normalize_hms)
 
-    rows = []
+    # --- Type vers heure (exactement comme chez toi) ---
+    type_to_heure = {
+        "Conseil": "Heure Conseil",
+        "Aphorisme": "Heure Aphorisme",
+        "Réflexion": "Heure Réflexion"
+    }
+
+    NB_JOURS = getattr(config, "NB_JOURS_GENERATION", 2)
+    # today 00:00:00 local
+    now_local = datetime.now(tz)
+    aujourdhui = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    window_start = aujourdhui
+
+    # --- Génération du planning ---
+    planning = []
     skips = {"client_vide":0,"canalid_vide":0,"date_invalide":0,"sans_heure":0}
-    max_date = max(dates_fenetre)
+    for _, row in df_filtree.iterrows():
+        nom_client = row["Client"]
+        programme = row["Programme"]
+        saison = int(row["Saison"])
+        chat_id = row["Canal ID"]
+        date_debut = row["Date de Démarrage"]
+        jours_diff = [j.lower() for j in row["Jours de Diffusion"]] if isinstance(row["Jours de Diffusion"], list) else []
 
-    for _, r in dfc.iterrows():
-        client = str(r["Client"]).strip()
-        if not client:
-            skips["client_vide"] += 1; continue
-        chat_id = str(r["Canal ID"]).strip()
-        if not chat_id:
-            skips["canalid_vide"] += 1; continue
-        d0 = r["Date de Démarrage"]
-        if pd.isna(d0):
-            skips["date_invalide"] += 1; continue
+        if not isinstance(nom_client, str) or nom_client.strip() == "":
+            skips["client_vide"] += 1
+            continue
+        if not isinstance(chat_id, str) or chat_id.strip() == "":
+            skips["canalid_vide"] += 1
+            continue
+        if pd.isna(date_debut):
+            skips["date_invalide"] += 1
+            continue
 
-        jours_aut = r["jours_set"]
-        # compute avancement counter per date
-        cnt = 0
-        av_by_date = {}
-        cur = d0
-        while cur <= max_date:
-            if (not jours_aut) or (_weekday_fr(cur) in jours_aut):
-                cnt += 1
-            av_by_date[cur] = cnt
-            cur += timedelta(days=1)
+        # Local date components (ignore tz for comparison at date level)
+        date_debut_local_date = date_debut.astimezone(tz).date() if getattr(date_debut, "tzinfo", None) else tz.localize(date_debut).date()
 
-        # produce for each date and type if hour present
-        any_hour = any(r[col] for col in type_to_hourcol.values())
-        if not any_hour:
-            skips["sans_heure"] += 1; continue
+        has_any_hour = any([row["Heure Conseil"], row["Heure Aphorisme"], row["Heure Réflexion"]])
+        if not has_any_hour:
+            skips["sans_heure"] += 1
+            continue
 
-        for d in dates_fenetre:
-            if jours_aut and _weekday_fr(d) not in jours_aut:
+        for i in range(NB_JOURS):
+            date_envoi = (window_start + timedelta(days=i)).date()
+            # respect des jours de diffusion
+            jour_nom = ["lundi","mardi","mercredi","jeudi","vendredi","samedi","dimanche"][ (window_start + timedelta(days=i)).weekday() ]
+            if jours_diff and jour_nom not in jours_diff:
                 continue
-            for typ, hcol in type_to_hourcol.items():
-                hh = r[hcol]
-                if not hh:
+            if date_envoi < date_debut_local_date:
+                continue
+            avancement = _compute_avancement(date_debut_local_date, date_envoi, jours_diff)
+
+            for type_msg, col_heure in type_to_heure.items():
+                heure = row[col_heure]
+                if not heure:
                     continue
-                rows.append({
-                    "client": client,
-                    "programme": str(r["Programme"]).zfill(3),
-                    "saison": int(r["Saison"]),
+                planning.append({
+                    "client": nom_client,
+                    "programme": programme,
+                    "saison": saison,
                     "chat_id": chat_id,
-                    "date": d.strftime("%Y-%m-%d"),
-                    "heure": hh,
-                    "type": typ,
-                    "avancement": int(av_by_date.get(d, 0)),
+                    "date": date_envoi.strftime("%Y-%m-%d"),
+                    "heure": heure,
+                    "type": type_msg,
+                    "avancement": avancement,
                     "message": "",
                     "format": "",
                     "url": "",
-                    "envoye": "non",
+                    "envoye": "non"
                 })
 
-    df_new = pd.DataFrame(rows)
-    print(f"[DEBUG] today={today} NB_JOURS={NB_JOURS} dates={dates_fenetre}")
+    df_nouveau = pd.DataFrame(planning)
+    print(f"[DEBUG] today={aujourdhui.date()} NB_JOURS={NB_JOURS} generated_rows={len(df_nouveau)}")
     print(f"[DEBUG] skips={skips}")
-    print(f"[DEBUG] Nouveau par date: {df_new['date'].value_counts().to_dict() if not df_new.empty else {}}")
 
-    # Read existing planning
-    recs = ws_planning.get_all_records()
-    if recs:
-        dfe = pd.DataFrame(recs)
-        for c in PLANNING_COLS:
-            if c not in dfe.columns: dfe[c] = ""
-        dfe["programme"] = dfe["programme"].apply(lambda x: str(x).zfill(3))
+    # --- Lecture planning existant ---
+    ws_planning = client_gsheets.open(config.FICHIER_PLANNING).worksheet(config.FEUILLE_PLANNING)
+    records = ws_planning.get_all_records()
+    colonnes_planning = [
+        "client", "programme", "saison", "chat_id", "date", "heure",
+        "type", "avancement", "message", "format", "url", "envoye"
+    ]
+    if records:
+        df_existant = pd.DataFrame(records)
+        for col in colonnes_planning:
+            if col not in df_existant.columns:
+                df_existant[col] = ""
+        df_existant["programme"] = df_existant["programme"].apply(lambda x: str(x).zfill(3))
     else:
-        dfe = pd.DataFrame(columns=PLANNING_COLS)
+        df_existant = pd.DataFrame(columns=colonnes_planning)
 
-    # purge older than today-RETENTION
-    def _to_date(x):
-        try: return pd.to_datetime(x).date()
-        except: return None
-    if not dfe.empty:
-        dfe["_d"] = dfe["date"].apply(_to_date)
-        cutoff = today - timedelta(days=RETENTION)
-        dfe = dfe[dfe["_d"].notna() & (dfe["_d"] >= cutoff)].drop(columns=["_d"])
+    # --- PURGE anciennes lignes (garder J-RETENTION) ---
+    RET = getattr(config, "RETENTION_JOURS", 2)
+    cutoff = aujourdhui.date() - timedelta(days=RET)
+    if not df_existant.empty:
+        df_existant["_date_obj"] = pd.to_datetime(df_existant["date"], errors="coerce").dt.date
+        df_existant = df_existant[df_existant["_date_obj"].notna()]
+        df_existant = df_existant[df_existant["_date_obj"] >= cutoff].drop(columns=["_date_obj"])
 
-    # merge, dedupe
-    df_all = pd.concat([dfe, df_new], ignore_index=True)
-    key = ["client","programme","saison","chat_id","date","heure","type"]
-    df_all.drop_duplicates(subset=key, keep="last", inplace=True)
+    # --- Fusion sans doublons (clé SANS avancement !) ---
+    df_merge = pd.concat([df_existant, df_nouveau], ignore_index=True)
+    df_merge["programme"] = df_merge["programme"].apply(lambda x: str(x).zfill(3))
+    df_merge["saison"] = pd.to_numeric(df_merge["saison"], errors="coerce").fillna(1).astype(int)
+    df_merge["avancement"] = pd.to_numeric(df_merge["avancement"], errors="coerce").fillna(1).astype(int)
 
-    # Build tz-aware _dt for sort
-    def mk_dt(row):
-        s = f"{row['date']} {row['heure']}"
-        return pd.to_datetime(s, errors="coerce")
-    df_all["_dt_naive"] = df_all.apply(mk_dt, axis=1)
-    tz = _tz()
-    mask = df_all["_dt_naive"].notna()
+    subset_keys = ["client", "programme", "saison", "chat_id", "date", "heure", "type"]
+    df_merge.drop_duplicates(subset=subset_keys, keep="first", inplace=True)
+    df_merge = df_merge.reindex(columns=colonnes_planning)
+
+    # --- Tri chronologique robuste ---
+    # Combine date + heure -> naive
+    dt_naive = pd.to_datetime(df_merge["date"].astype(str) + " " + df_merge["heure"].astype(str), errors="coerce")
+    # Localize safely
+    mask = dt_naive.notna()
+    df_merge["_dt"] = pd.NaT
     if mask.any():
-        localized = df_all.loc[mask, "_dt_naive"].astype("datetime64[ns]").dt.tz_localize(tz, ambiguous="infer", nonexistent="shift_forward")
-        # initialize column with NaT tz-aware to avoid dtype warnings
-        df_all["_dt"] = pd.NaT
-        df_all["_dt"] = df_all["_dt"].astype("datetime64[ns, {}]".format(tz.zone))
-        df_all.loc[mask, "_dt"] = localized
-    else:
-        df_all["_dt"] = pd.NaT
+        df_merge.loc[mask, "_dt"] = dt_naive[mask].dt.tz_localize(tz, ambiguous="infer", nonexistent="shift_forward")
+    df_merge.sort_values(by=["_dt","client","type"], inplace=True, kind="stable")
+    df_merge.drop(columns=["_dt"], inplace=True)
 
-    # Fill messages from programmes
-    try:
-        doc_prog = gc.open(config.FICHIER_PROGRAMMES)
-    except Exception:
-        doc_prog = None
-
-    cache = {}
-    msgs, fmts, urls = [], [], []
-
-    for _, row in df_all.iterrows():
-        if doc_prog is None:
-            msgs.append(""); fmts.append("texte"); urls.append(""); continue
-        prog = str(row["programme"]).zfill(3)
-        if prog not in cache:
-            try:
-                ws = doc_prog.worksheet(prog)
-                dfp = pd.DataFrame(ws.get_all_records())
-                for c in PROGRAMME_COLS:
+    # --- Préchargement des programmes ---
+    programmes_charges = defaultdict(pd.DataFrame)
+    for prog_id in df_merge["programme"].dropna().unique():
+        try:
+            ws = client_gsheets.open(config.FICHIER_PROGRAMMES).worksheet(str(prog_id))
+            dfp = pd.DataFrame(ws.get_all_records())
+            # types/dtypes
+            if not dfp.empty:
+                dfp["Saison"] = pd.to_numeric(dfp.get("Saison", 1), errors="coerce").fillna(1).astype(int)
+                dfp["Jour"] = pd.to_numeric(dfp.get("Jour", 1), errors="coerce").fillna(1).astype(int)
+                for c in ["Support","Type","Phrase","Format","Url"]:
                     if c not in dfp.columns: dfp[c] = ""
-                dfp["Saison"] = pd.to_numeric(dfp["Saison"], errors="coerce").fillna(1).astype(int)
-                dfp["Jour"] = pd.to_numeric(dfp["Jour"], errors="coerce").fillna(1).astype(int)
-                cache[prog] = dfp
-            except Exception:
-                cache[prog] = pd.DataFrame(columns=PROGRAMME_COLS)
+            programmes_charges[str(prog_id)] = dfp
+        except Exception:
+            programmes_charges[str(prog_id)] = pd.DataFrame(columns=["Support","Saison","Jour","Type","Phrase","Format","Url"])
 
-        dfp = cache[prog]
-        if dfp.empty:
-            msgs.append(""); fmts.append("texte"); urls.append(""); continue
+    # --- Remplissage des messages, format, url ---
+    type_mapping = {"Conseil": "2-Conseil", "Aphorisme": "1-Aphorisme", "Réflexion": "3-Réflexion"}
+    messages_remplis, formats_remplis, urls_remplis = [], [], []
+    for _, row in df_merge.iterrows():
+        # si déjà rempli, conserver
+        if isinstance(row.get("message", ""), str) and row["message"].strip() != "":
+            messages_remplis.append(row["message"])
+            formats_remplis.append(str(row.get("format", "texte")).strip().lower() or "texte")
+            urls_remplis.append(str(row.get("url", "")))
+            continue
+        programme = str(row["programme"]).zfill(3)
+        saison = int(row["saison"])
+        jour = int(row["avancement"])
+        type_excel = type_mapping.get(str(row["type"]), None)
+        df_prog = programmes_charges.get(programme, pd.DataFrame())
 
-        saison = int(row["saison"]); jour = int(row["avancement"])
-        local_type = str(row["type"]).strip()
-        cands = _type_candidates(local_type)
+        if type_excel and not df_prog.empty:
+            filtre = ((df_prog["Saison"] == saison) & (df_prog["Jour"] == jour) & (df_prog["Type"] == type_excel))
+            ligne = df_prog[filtre]
+            if not ligne.empty:
+                phrase = str(ligne.iloc[0].get("Phrase", ""))
+                format_msg = str(ligne.iloc[0].get("Format", "texte")).strip().lower() or "texte"
+                url_msg = str(ligne.iloc[0].get("Url", ""))
+                messages_remplis.append(f"Saison {saison} - Jour {jour} : \n{row['type']} : {phrase}")
+                formats_remplis.append(format_msg)
+                urls_remplis.append(url_msg)
+                continue
+        # default si pas trouvé
+        messages_remplis.append("")
+        formats_remplis.append("texte")
+        urls_remplis.append("")
 
-        sub = dfp[(dfp["Saison"]==saison) & (dfp["Jour"]==jour)]
-        # try to match Type with multiple candidates (case/accents tolerant)
-        if not sub.empty:
-            # precompute normalized type column
-            col_norm = dfp["Type"].apply(_normalize)
-            sub = dfp.loc[sub.index]
-            sub_norm = col_norm.loc[sub.index]
-            found = None
-            cand_norms = [_normalize(c) for c in cands]
-            for i, norm in zip(sub.index, sub_norm):
-                if norm in cand_norms:
-                    found = dfp.loc[i]
-                    break
-            if found is not None:
-                phrase = str(found.get("Phrase",""))
-                fmt = str(found.get("Format","texte")).strip().lower() or "texte"
-                url = str(found.get("Url",""))
-                msgs.append(f"Saison {saison} - Jour {jour} : \n{local_type} : {phrase}")
-                fmts.append(fmt); urls.append(url); continue
+    df_merge["message"] = messages_remplis
+    df_merge["format"] = formats_remplis
+    df_merge["url"] = urls_remplis
 
-        # default if not matched
-        msgs.append("")
-        fmts.append("texte")
-        urls.append("")
+    # --- Sauvegarde dans Google Sheet ---
+    for col in df_merge.columns:
+        df_merge[col] = df_merge[col].astype(str)
 
-    df_all["message"] = msgs
-    df_all["format"] = fmts
-    df_all["url"] = urls
-
-    print("[DEBUG] Total par date (après fusion):", df_all["date"].value_counts().to_dict())
-
-    # Write back (full write like original)
-    # cast to string to avoid NaN
-    for c in df_all.columns:
-        df_all[c] = df_all[c].astype(str)
-    # order columns as PLANNING_COLS
-    out = df_all[PLANNING_COLS]
     ws_planning.clear()
-    ws_planning.update([out.columns.tolist()] + out.values.tolist())
+    ws_planning.update([df_merge.columns.values.tolist()] + df_merge.values.tolist())
 
+    # Stats
+    by_date_new = df_nouveau.groupby("date")["client"].count().to_dict() if not df_nouveau.empty else {}
+    print(f"[DEBUG] Nouveau par date: {by_date_new}")
+    by_date_total = pd.Series(df_merge["date"]).value_counts().sort_index().to_dict()
+    print(f"[DEBUG] Total par date (après fusion): {by_date_total}")
     print(f"📅 Mise à jour planning à {datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
 if __name__ == "__main__":
