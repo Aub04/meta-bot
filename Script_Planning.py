@@ -47,7 +47,7 @@ def _norm_time_hms(val):
 def _norm_date_str(val):
     # Expect input like 'YYYY-MM-DD' or variants; output 'YYYY-MM-DD'
     try:
-        dt = pd.to_datetime(val, dayfirst=True, errors="coerce")
+        dt = pd.to_datetime(val, format="%Y-%m-%d", errors="coerce")
         if pd.isna(dt):
             return ""
         return dt.strftime("%Y-%m-%d")
