@@ -17,7 +17,7 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', 'VOTRE_TOKEN_PAR_DEFAUT')
 
 
 # === ⏱️ Autres paramètres
-NB_JOURS_GENERATION = 2 # Nombre de jours de planning à générer
+NB_JOURS_GENERATION = 3 # Nombre de jours de planning à générer
 RETENTION_JOURS = 2          # garde J-2 (purge plus vieux)
 GSHEETS_MAX_RETRIES = 5
 GSHEETS_RETRY_BASE = 1.5     # exponentiel (1.5^n) + jitter
