@@ -4,13 +4,9 @@ import pandas as pd
 from datetime import datetime, timedelta
 import pytz
 import random
-import time
 import config
 
-# ======================
-# Helpers
-# ======================
-
+# === Helpers ===
 def _tz():
     try:
         return pytz.timezone(config.FUSEAU_HORAIRE)
@@ -43,57 +39,41 @@ def _parse_jours_diffusion(s):
     raw = str(s).lower().replace(";", ",")
     parts = [x.strip() for x in raw.split(",") if x.strip()]
     mapping = {
-        "monday":"lundi","tuesday":"mardi","wednesday":"mercredi",
-        "thursday":"jeudi","friday":"vendredi","saturday":"samedi","sunday":"dimanche"
+        "monday": "lundi", "tuesday": "mardi", "wednesday": "mercredi",
+        "thursday": "jeudi", "friday": "vendredi", "saturday": "samedi", "sunday": "dimanche",
     }
-    return set(mapping.get(p, p) for p in parts)
+    out = []
+    for p in parts:
+        out.append(mapping.get(p, p))
+    return set(out)
 
 def _weekday_fr(dt_date):
     jours = ["lundi","mardi","mercredi","jeudi","vendredi","samedi","dimanche"]
     return jours[dt_date.weekday()]
 
-# Simple retry wrapper for gspread ops (503/502/500/429)
-def _retry(fn, *args, **kwargs):
-    max_retries = getattr(config, "GSHEETS_MAX_RETRIES", 5)
-    base = getattr(config, "GSHEETS_RETRY_BASE", 1.5)
-    for attempt in range(max_retries):
-        try:
-            return fn(*args, **kwargs)
-        except Exception as e:
-            msg = str(e).lower()
-            if any(code in msg for code in [" 500", " 502", " 503", " 504", " 429", "service is currently unavailable"]):
-                sleep_s = (base ** attempt) + random.random()
-                time.sleep(sleep_s)
-                continue
-            raise
-    # last try
-    return fn(*args, **kwargs)
-
-# ======================
-# Main
-# ======================
-
 def generer_planning():
     tz = _tz()
 
+    # Auth
     scope = [
         "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/drive"
     ]
     creds = Credentials.from_service_account_file(config.CHEMIN_CLE_JSON, scopes=scope)
-    client = gspread.authorize(creds)
+    client_gsheets = gspread.authorize(creds)
 
-    ws_clients = _retry(client.open, config.FICHIER_CLIENTS).worksheet(config.FEUILLE_CLIENTS)
-    ws_planning = _retry(client.open, config.FICHIER_PLANNING).worksheet(config.FEUILLE_PLANNING)
+    ws_clients = client_gsheets.open(config.FICHIER_CLIENTS).worksheet(config.FEUILLE_CLIENTS)
+    ws_planning = client_gsheets.open(config.FICHIER_PLANNING).worksheet(config.FEUILLE_PLANNING)
 
-    df_clients = pd.DataFrame(_retry(ws_clients.get_all_records))
+    df_clients = pd.DataFrame(ws_clients.get_all_records())
     if df_clients.empty:
         print("Aucun client.")
         return
 
     cols_req = [
-        "Client","Programme","Saison","chat_id","Date de Démarrage",
-        "Jours de Diffusion","Heure Conseil","Heure Aphorisme","Heure Réflexion"
+        "Client", "Programme", "Saison", "chat_id",
+        "Date de Démarrage", "Jours de Diffusion",
+        "Heure Conseil", "Heure Aphorisme", "Heure Réflexion"
     ]
     for c in cols_req:
         if c not in df_clients.columns:
@@ -102,12 +82,10 @@ def generer_planning():
     df_clients["Programme"] = df_clients["Programme"].apply(lambda x: str(x).zfill(3))
     df_clients["Saison"] = pd.to_numeric(df_clients["Saison"], errors="coerce").fillna(1).astype(int)
 
-    # User had dd/mm/YYYY sometimes -> set dayfirst=True to silence warning
-    df_clients["Date de Démarrage"] = pd.to_datetime(
-        df_clients["Date de Démarrage"], errors="coerce", dayfirst=True
-    ).dt.date
+    # Parse FR dates safely
+    df_clients["Date de Démarrage"] = pd.to_datetime(df_clients["Date de Démarrage"], errors="coerce", dayfirst=True).dt.date
 
-    for hcol in ["Heure Conseil","Heure Aphorisme","Heure Réflexion"]:
+    for hcol in ["Heure Conseil", "Heure Aphorisme", "Heure Réflexion"]:
         df_clients[hcol] = df_clients[hcol].apply(_to_time_hms)
 
     df_clients["jours_set"] = df_clients["Jours de Diffusion"].apply(_parse_jours_diffusion)
@@ -116,13 +94,16 @@ def generer_planning():
     today_local = datetime.now(tz).date()
     dates_fenetre = [today_local + timedelta(days=i) for i in range(NB_JOURS)]
 
+    print(f"[DEBUG] today_local={today_local} NB_JOURS={NB_JOURS} dates_fenetre={dates_fenetre}")
+
     type_to_heure = {
-        "Conseil":"Heure Conseil",
-        "Aphorisme":"Heure Aphorisme",
-        "Réflexion":"Heure Réflexion",
+        "Conseil": "Heure Conseil",
+        "Aphorisme": "Heure Aphorisme",
+        "Réflexion": "Heure Réflexion",
     }
 
     planning_rows = []
+    debug_clients = []
     for _, row in df_clients.iterrows():
         nom_client = str(row["Client"]).strip()
         programme = str(row["Programme"]).zfill(3)
@@ -143,6 +124,9 @@ def generer_planning():
                 compteur += 1
             avancement_par_date[cur] = compteur
             cur += timedelta(days=1)
+
+        # Debug sample
+        debug_clients.append((nom_client, sorted(list(jours_autorises))))
 
         for d in dates_fenetre:
             if _weekday_fr(d) not in jours_autorises and len(jours_autorises) != 0:
@@ -168,12 +152,19 @@ def generer_planning():
                 })
 
     df_nouveau = pd.DataFrame(planning_rows)
+    # Debug counts nouveau
+    if not df_nouveau.empty:
+        counts_new = df_nouveau["date"].value_counts().sort_index().to_dict()
+        print(f"[DEBUG] Nouveau par date: {counts_new}")
+    else:
+        print("[DEBUG] df_nouveau est vide")
 
+    # Lire planning existant
     colonnes_planning = [
-        "client","programme","saison","chat_id","date","heure",
-        "type","avancement","message","format","url","envoye",
+        "client", "programme", "saison", "chat_id", "date", "heure",
+        "type", "avancement", "message", "format", "url", "envoye",
     ]
-    records = _retry(ws_planning.get_all_records)
+    records = ws_planning.get_all_records()
     if records:
         df_existant = pd.DataFrame(records)
         for col in colonnes_planning:
@@ -183,6 +174,7 @@ def generer_planning():
     else:
         df_existant = pd.DataFrame(columns=colonnes_planning)
 
+    # Purge
     RETENTION = getattr(config, "RETENTION_JOURS", 2)
     cutoff_date = today_local - timedelta(days=RETENTION)
 
@@ -198,25 +190,32 @@ def generer_planning():
         df_existant = df_existant[df_existant["_date_obj"] >= cutoff_date].drop(columns=["_date_obj"])
 
     df_all = pd.concat([df_existant, df_nouveau], ignore_index=True)
-    df_all["programme"] = df_all["programme"].apply(lambda x: str(x).zfill(3))
-    df_all["saison"] = pd.to_numeric(df_all["saison"], errors="coerce").fillna(1).astype(int)
-    df_all["avancement"] = pd.to_numeric(df_all["avancement"], errors="coerce").fillna(1).astype(int)
-    df_all["envoye"] = df_all["envoye"].replace({pd.NA:"non", None:"non", "":"non"})
 
-    key_cols = ["client","programme","saison","chat_id","date","heure","type"]
-    df_all.drop_duplicates(subset=key_cols, keep="last", inplace=True)
-
-    # Build dt for sorting (fix dtype warning by building a dedicated series and assigning once)
-    s_naive = pd.to_datetime((df_all["date"] + " " + df_all["heure"]).str.strip(), errors="coerce")
-    s_local = _localize_safe(s_naive.astype("datetime64[ns]"), tz)
-    df_all["_dt"] = s_local
+    # Build dt safely
+    df_all["_dt_str"] = (df_all["date"].astype(str) + " " + df_all["heure"].astype(str)).str.strip()
+    df_all["_dt_naive"] = pd.to_datetime(df_all["_dt_str"], errors="coerce")
+    mask = df_all["_dt_naive"].notna()
+    df_all["_dt"] = pd.NaT
+    if mask.any():
+        localized = _localize_safe(df_all.loc[mask, "_dt_naive"].astype("datetime64[ns]"), tz)
+        df_all.loc[mask, "_dt"] = localized
 
     df_all.sort_values(by=["_dt","client","type"], inplace=True, kind="stable")
-    df_all.drop(columns=["_dt"], inplace=True)
+    df_all.drop(columns=["_dt_str","_dt_naive"], inplace=True)
 
-    # --- Fill messages from programme sheets ---
+    # Debug counts after merge
+    if not df_all.empty:
+        counts_all = df_all["date"].value_counts().sort_index().to_dict()
+        print(f"[DEBUG] Total par date (après fusion): {counts_all}")
+    # Debug sample clients
+    if debug_clients:
+        # print up to 3 clients jours_set
+        sample = debug_clients[:3]
+        print(f"[DEBUG] échantillon jours_set clients: {sample}")
+
+    # Remplissage messages (idem version clean)
     try:
-        doc_prog = _retry(client.open, config.FICHIER_PROGRAMMES)
+        doc_prog = client_gsheets.open(config.FICHIER_PROGRAMMES)
     except Exception:
         doc_prog = None
     programmes_cache = {}
@@ -230,15 +229,12 @@ def generer_planning():
     messages, formats, urls = [], [], []
     for _, r in df_all.iterrows():
         if not doc_prog:
-            messages.append("")
-            formats.append("texte")
-            urls.append("")
-            continue
+            messages.append(""); formats.append("texte"); urls.append(""); continue
         prog = str(r["programme"]).zfill(3)
         if prog not in programmes_cache:
             try:
-                ws = _retry(doc_prog.worksheet, prog)
-                dfp = pd.DataFrame(_retry(ws.get_all_records))
+                ws = doc_prog.worksheet(prog)
+                dfp = pd.DataFrame(ws.get_all_records())
                 for c in ["Saison","Jour","Type","Phrase","Format","Url"]:
                     if c not in dfp.columns:
                         dfp[c] = ""
@@ -248,20 +244,17 @@ def generer_planning():
             except Exception:
                 programmes_cache[prog] = pd.DataFrame(columns=["Saison","Jour","Type","Phrase","Format","Url"])
         dfp = programmes_cache.get(prog, pd.DataFrame())
-        saison = int(r["saison"])
-        jour = int(r["avancement"])
+        saison = int(r["saison"]) if pd.notna(r["saison"]) else 1
+        jour = int(r["avancement"]) if pd.notna(r["avancement"]) else 1
         type_excel = type_mapping.get(str(r["type"]).strip(), None)
         if type_excel is None or dfp.empty:
-            messages.append("")
-            formats.append("texte")
-            urls.append("")
-            continue
+            messages.append(""); formats.append("texte"); urls.append(""); continue
         sel = (dfp["Saison"] == saison) & (dfp["Jour"] == jour) & (dfp["Type"] == type_excel)
         match = dfp[sel]
         if not match.empty:
-            phrase = str(match.iloc[0].get("Phrase",""))
-            fmt = str(match.iloc[0].get("Format","texte")).strip().lower() or "texte"
-            url = str(match.iloc[0].get("Url",""))
+            phrase = str(match.iloc[0].get("Phrase", ""))
+            fmt = str(match.iloc[0].get("Format", "texte")).strip().lower() or "texte"
+            url = str(match.iloc[0].get("Url", ""))
             messages.append(f"Saison {saison} - Jour {jour} : \n{r['type']} : {phrase}")
             formats.append(fmt)
             urls.append(url)
@@ -278,12 +271,9 @@ def generer_planning():
     for c in df_all.columns:
         df_all[c] = df_all[c].astype(str)
 
-    _retry(ws_planning.clear)
-    _retry(ws_planning.update, [df_all.columns.tolist()] + df_all.values.tolist())
+    ws_planning.clear()
+    ws_planning.update([df_all.columns.tolist()] + df_all.values.tolist())
 
-    # Debug: show counts per date to help operator
-    counts = df_all["date"].value_counts().sort_index()
-    print("Comptes par date:", dict(counts))
     print(f"📅 Mise à jour planning à {datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
 if __name__ == "__main__":
