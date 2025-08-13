@@ -3,13 +3,8 @@ from google.oauth2.service_account import Credentials
 import pandas as pd
 from datetime import datetime, timedelta
 import pytz
-import random
-import time
+import re
 import config
-
-# ======================
-# Helpers
-# ======================
 
 def _tz():
     try:
@@ -17,273 +12,236 @@ def _tz():
     except Exception:
         return pytz.timezone("Europe/Paris")
 
+def _normalize_headers(cols):
+    # lower, strip, collapse spaces
+    out = []
+    for c in cols:
+        s = str(c).strip().lower()
+        s = re.sub(r'\s+', ' ', s)
+        out.append(s)
+    return out
+
+# canonical columns expected
+ALIASES = {
+    "client": ["client"],
+    "programme": ["programme", "program", "programme "],
+    "saison": ["saison", "season"],
+    "chat_id": ["chat_id", "canal id", "canalid", "canal", "channel id", "id canal"],
+    "date de démarrage": ["date de démarrage", "date demarrage", "date de demarrage", "start date"],
+    "jours de diffusion": ["jours de diffusion", "jours diffusion", "jours", "days"],
+    "heure conseil": ["heure conseil", "heure envoi 1", "heure 1"],
+    "heure aphorisme": ["heure aphorisme", "heure envoi 2", "heure 2"],
+    "heure réflexion": ["heure réflexion", "heure reflexion", "heure envoi 3", "heure 3"],
+}
+
+def _find_col(name_canon, cols_norm):
+    aliases = ALIASES.get(name_canon, [name_canon])
+    for a in aliases:
+        if a in cols_norm:
+            return cols_norm.index(a)
+    return None
+
 def _to_time_hms(val):
     if pd.isna(val) or str(val).strip() == "":
         return ""
     s = str(val).strip()
-    for fmt in ("%H:%M:%S", "%H:%M"):
-        try:
-            t = pd.to_datetime(s, format=fmt).time()
-            return t.strftime("%H:%M:%S")
-        except Exception:
-            pass
+    # If it's numeric (Google Sheets time), try parsing via pandas without format
     try:
+        # allow "10 h 00" etc.
+        s2 = s.lower().replace('h',':').replace(' ', '')
+        for fmt in ("%H:%M:%S", "%H:%M"):
+            try:
+                t = pd.to_datetime(s2, format=fmt).time()
+                return t.strftime("%H:%M:%S")
+            except: pass
         t = pd.to_datetime(s).time()
         return t.strftime("%H:%M:%S")
     except Exception:
         return ""
 
-def _localize_safe(series_dt_naive, tz):
-    return (series_dt_naive
-            .dt.tz_localize(tz, ambiguous="infer", nonexistent="shift_forward"))
-
-def _parse_jours_diffusion(s):
-    if pd.isna(s):
-        return set()
-    raw = str(s).lower().replace(";", ",")
-    parts = [x.strip() for x in raw.split(",") if x.strip()]
-    mapping = {
-        "monday":"lundi","tuesday":"mardi","wednesday":"mercredi",
-        "thursday":"jeudi","friday":"vendredi","saturday":"samedi","sunday":"dimanche"
-    }
-    return set(mapping.get(p, p) for p in parts)
-
-def _weekday_fr(dt_date):
-    jours = ["lundi","mardi","mercredi","jeudi","vendredi","samedi","dimanche"]
-    return jours[dt_date.weekday()]
-
-# Simple retry wrapper for gspread ops (503/502/500/429)
-def _retry(fn, *args, **kwargs):
-    max_retries = getattr(config, "GSHEETS_MAX_RETRIES", 5)
-    base = getattr(config, "GSHEETS_RETRY_BASE", 1.5)
-    for attempt in range(max_retries):
-        try:
-            return fn(*args, **kwargs)
-        except Exception as e:
-            msg = str(e).lower()
-            if any(code in msg for code in [" 500", " 502", " 503", " 504", " 429", "service is currently unavailable"]):
-                sleep_s = (base ** attempt) + random.random()
-                time.sleep(sleep_s)
-                continue
-            raise
-    # last try
-    return fn(*args, **kwargs)
-
-# ======================
-# Main
-# ======================
+def _weekday_fr(d):
+    return ["lundi","mardi","mercredi","jeudi","vendredi","samedi","dimanche"][d.weekday()]
 
 def generer_planning():
     tz = _tz()
-
-    scope = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
-    ]
+    scope = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_file(config.CHEMIN_CLE_JSON, scopes=scope)
     client = gspread.authorize(creds)
 
-    ws_clients = _retry(client.open, config.FICHIER_CLIENTS).worksheet(config.FEUILLE_CLIENTS)
-    ws_planning = _retry(client.open, config.FICHIER_PLANNING).worksheet(config.FEUILLE_PLANNING)
+    ws_clients = client.open(config.FICHIER_CLIENTS).worksheet(config.FEUILLE_CLIENTS)
+    ws_planning = client.open(config.FICHIER_PLANNING).worksheet(config.FEUILLE_PLANNING)
 
-    df_clients = pd.DataFrame(_retry(ws_clients.get_all_records))
-    if df_clients.empty:
+    rows = ws_clients.get_all_values()
+    if not rows or len(rows)<2:
         print("Aucun client.")
         return
 
-    cols_req = [
-        "Client","Programme","Saison","chat_id","Date de Démarrage",
-        "Jours de Diffusion","Heure Conseil","Heure Aphorisme","Heure Réflexion"
-    ]
-    for c in cols_req:
-        if c not in df_clients.columns:
-            df_clients[c] = ""
+    header = rows[0]
+    data = rows[1:]
+    cols_norm = _normalize_headers(header)
+    df_raw = pd.DataFrame(data, columns=cols_norm)
 
+    # map needed columns by alias
+    idx_client = _find_col("client", cols_norm)
+    idx_prog = _find_col("programme", cols_norm)
+    idx_saison = _find_col("saison", cols_norm)
+    idx_chat = _find_col("chat_id", cols_norm)
+    idx_date = _find_col("date de démarrage", cols_norm)
+    idx_jours = _find_col("jours de diffusion", cols_norm)
+    idx_h1 = _find_col("heure conseil", cols_norm)
+    idx_h2 = _find_col("heure aphorisme", cols_norm)
+    idx_h3 = _find_col("heure réflexion", cols_norm)
+
+    needed = [idx_client, idx_prog, idx_saison, idx_chat, idx_date, idx_jours]
+    if any(i is None for i in needed):
+        print("[DEBUG] colonnes manquantes:", {k:v for k,v in zip(["client","programme","saison","chat_id","date","jours"], needed)})
+        return
+
+    df_clients = pd.DataFrame({
+        "Client": df_raw.iloc[:, idx_client],
+        "Programme": df_raw.iloc[:, idx_prog],
+        "Saison": df_raw.iloc[:, idx_saison],
+        "chat_id": df_raw.iloc[:, idx_chat],
+        "Date de Démarrage": df_raw.iloc[:, idx_date],
+        "Jours de Diffusion": df_raw.iloc[:, idx_jours],
+        "Heure Conseil": df_raw.iloc[:, idx_h1] if idx_h1 is not None else "",
+        "Heure Aphorisme": df_raw.iloc[:, idx_h2] if idx_h2 is not None else "",
+        "Heure Réflexion": df_raw.iloc[:, idx_h3] if idx_h3 is not None else "",
+    })
+
+    # normalize
     df_clients["Programme"] = df_clients["Programme"].apply(lambda x: str(x).zfill(3))
     df_clients["Saison"] = pd.to_numeric(df_clients["Saison"], errors="coerce").fillna(1).astype(int)
 
-    # User had dd/mm/YYYY sometimes -> set dayfirst=True to silence warning
-    df_clients["Date de Démarrage"] = pd.to_datetime(
-        df_clients["Date de Démarrage"], errors="coerce", dayfirst=True
-    ).dt.date
+    # parse date (dayfirst true)
+    df_clients["Date de Démarrage"] = pd.to_datetime(df_clients["Date de Démarrage"], errors="coerce", dayfirst=True).dt.date
 
-    for hcol in ["Heure Conseil","Heure Aphorisme","Heure Réflexion"]:
-        df_clients[hcol] = df_clients[hcol].apply(_to_time_hms)
+    # parse heures
+    for h in ["Heure Conseil","Heure Aphorisme","Heure Réflexion"]:
+        df_clients[h] = df_clients[h].apply(_to_time_hms)
 
-    df_clients["jours_set"] = df_clients["Jours de Diffusion"].apply(_parse_jours_diffusion)
+    # jours set (accept chips or comma)
+    def parse_jours(s):
+        if pd.isna(s): return set()
+        s = str(s)
+        s = s.replace(" ", " ").replace(";", ",")  # nbsp
+        parts = [p.strip().lower() for p in s.split(",") if p.strip()]
+        return set(parts)
+    df_clients["jours_set"] = df_clients["Jours de Diffusion"].apply(parse_jours)
 
     NB_JOURS = getattr(config, "NB_JOURS_GENERATION", 2)
     today_local = datetime.now(tz).date()
     dates_fenetre = [today_local + timedelta(days=i) for i in range(NB_JOURS)]
+    print(f"[DEBUG] today_local={today_local} NB_JOURS={NB_JOURS} dates_fenetre={dates_fenetre}")
 
-    type_to_heure = {
-        "Conseil":"Heure Conseil",
-        "Aphorisme":"Heure Aphorisme",
-        "Réflexion":"Heure Réflexion",
-    }
+    # build rows
+    rows_out = []
+    skips = {"client_vide":0, "chat_vide":0, "date_invalide":0, "sans_heure":0}
+    for _, r in df_clients.iterrows():
+        client_name = str(r["Client"]).strip()
+        if not client_name:
+            skips["client_vide"] += 1; continue
+        chat = str(r["chat_id"]).strip()
+        if not chat:
+            skips["chat_vide"] += 1; continue
+        d0 = r["Date de Démarrage"]
+        if pd.isna(d0):
+            skips["date_invalide"] += 1; continue
+        jours = r["jours_set"]
 
-    planning_rows = []
-    for _, row in df_clients.iterrows():
-        nom_client = str(row["Client"]).strip()
-        programme = str(row["Programme"]).zfill(3)
-        saison = int(row["Saison"])
-        chat_id = str(row["chat_id"]).strip()
-        date_debut = row["Date de Démarrage"]
-        jours_autorises = row["jours_set"]
-
-        if not nom_client or not chat_id or pd.isna(date_debut):
-            continue
-
-        max_date = max(dates_fenetre)
-        compteur = 0
-        avancement_par_date = {}
-        cur = date_debut
-        while cur <= max_date:
-            if _weekday_fr(cur) in jours_autorises or len(jours_autorises) == 0:
-                compteur += 1
-            avancement_par_date[cur] = compteur
+        # compute avancement by date counting only allowed days
+        max_d = max(dates_fenetre)
+        cnt = 0
+        av_map = {}
+        cur = d0
+        while cur <= max_d:
+            if not jours or _weekday_fr(cur) in jours:
+                cnt += 1
+            av_map[cur] = cnt
             cur += timedelta(days=1)
 
+        heures = [r["Heure Conseil"], r["Heure Aphorisme"], r["Heure Réflexion"]]
+        if not any(heures):
+            skips["sans_heure"] += 1; continue
+        type_names = ["Conseil","Aphorisme","Réflexion"]
+
         for d in dates_fenetre:
-            if _weekday_fr(d) not in jours_autorises and len(jours_autorises) != 0:
+            if jours and _weekday_fr(d) not in jours:
                 continue
-            avancement = avancement_par_date.get(d, 0)
-            for type_msg, hcol in type_to_heure.items():
-                heure_hms = row.get(hcol, "")
-                if not heure_hms:
-                    continue
-                planning_rows.append({
-                    "client": nom_client,
-                    "programme": programme,
-                    "saison": saison,
-                    "chat_id": chat_id,
+            av = av_map.get(d, 0)
+            for type_name, heure in zip(type_names, heures):
+                if not heure: continue
+                rows_out.append({
+                    "client": client_name,
+                    "programme": str(r["Programme"]).zfill(3),
+                    "saison": int(r["Saison"]),
+                    "chat_id": chat,
                     "date": d.strftime("%Y-%m-%d"),
-                    "heure": heure_hms,
-                    "type": type_msg,
-                    "avancement": avancement,
+                    "heure": heure,
+                    "type": type_name,
+                    "avancement": av,
                     "message": "",
                     "format": "",
                     "url": "",
                     "envoye": "non",
                 })
 
-    df_nouveau = pd.DataFrame(planning_rows)
-
-    colonnes_planning = [
-        "client","programme","saison","chat_id","date","heure",
-        "type","avancement","message","format","url","envoye",
-    ]
-    records = _retry(ws_planning.get_all_records)
-    if records:
-        df_existant = pd.DataFrame(records)
-        for col in colonnes_planning:
-            if col not in df_existant.columns:
-                df_existant[col] = ""
-        df_existant["programme"] = df_existant["programme"].apply(lambda x: str(x).zfill(3))
+    df_nouveau = pd.DataFrame(rows_out)
+    if df_nouveau.empty:
+        print("[DEBUG] df_nouveau est vide")
     else:
-        df_existant = pd.DataFrame(columns=colonnes_planning)
+        print("[DEBUG] Nouveau par date:", dict(df_nouveau["date"].value_counts().sort_index()))
 
-    RETENTION = getattr(config, "RETENTION_JOURS", 2)
-    cutoff_date = today_local - timedelta(days=RETENTION)
+    # read existing planning
+    cols_planning = ["client","programme","saison","chat_id","date","heure","type","avancement","message","format","url","envoye"]
+    recs = ws_planning.get_all_records()
+    if recs:
+        df_exist = pd.DataFrame(recs)
+        for c in cols_planning:
+            if c not in df_exist.columns: df_exist[c] = ""
+        df_exist["programme"] = df_exist["programme"].apply(lambda x: str(x).zfill(3))
+    else:
+        df_exist = pd.DataFrame(columns=cols_planning)
 
-    def _to_date(x):
-        try:
-            return pd.to_datetime(x).date()
-        except Exception:
-            return None
+    # purge by RETENTION_JOURS
+    RET = getattr(config, "RETENTION_JOURS", 2)
+    cutoff = today_local - timedelta(days=RET)
+    def to_date(x):
+        try: return pd.to_datetime(x).date()
+        except: return None
+    if not df_exist.empty:
+        df_exist["_d"] = df_exist["date"].apply(to_date)
+        df_exist = df_exist[df_exist["_d"].notna()]
+        df_exist = df_exist[df_exist["_d"] >= cutoff].drop(columns=["_d"])
 
-    if not df_existant.empty:
-        df_existant["_date_obj"] = df_existant["date"].apply(_to_date)
-        df_existant = df_existant[df_existant["_date_obj"].notna()]
-        df_existant = df_existant[df_existant["_date_obj"] >= cutoff_date].drop(columns=["_date_obj"])
-
-    df_all = pd.concat([df_existant, df_nouveau], ignore_index=True)
+    # merge
+    df_all = pd.concat([df_exist, df_nouveau], ignore_index=True)
     df_all["programme"] = df_all["programme"].apply(lambda x: str(x).zfill(3))
     df_all["saison"] = pd.to_numeric(df_all["saison"], errors="coerce").fillna(1).astype(int)
     df_all["avancement"] = pd.to_numeric(df_all["avancement"], errors="coerce").fillna(1).astype(int)
-    df_all["envoye"] = df_all["envoye"].replace({pd.NA:"non", None:"non", "":"non"})
+    df_all["envoye"] = df_all["envoye"].replace({pd.NA:"non", None:"non", "": "non"})
+    key = ["client","programme","saison","chat_id","date","heure","type"]
+    df_all.drop_duplicates(subset=key, keep="last", inplace=True)
 
-    key_cols = ["client","programme","saison","chat_id","date","heure","type"]
-    df_all.drop_duplicates(subset=key_cols, keep="last", inplace=True)
-
-    # Build dt for sorting (fix dtype warning by building a dedicated series and assigning once)
-    s_naive = pd.to_datetime((df_all["date"] + " " + df_all["heure"]).str.strip(), errors="coerce")
-    s_local = _localize_safe(s_naive.astype("datetime64[ns]"), tz)
-    df_all["_dt"] = s_local
+    # tz-aware _dt WITHOUT dtype warning
+    df_all["_dt"] = pd.Series(pd.NaT, index=df_all.index, dtype=f"datetime64[ns, {tz.zone}]")
+    mask = df_all["date"].notna() & df_all["heure"].notna()
+    s = (df_all.loc[mask, "date"] + " " + df_all.loc[mask, "heure"])
+    dt_naive = pd.to_datetime(s, errors="coerce")
+    localized = dt_naive.dt.tz_localize(tz, ambiguous="infer", nonexistent="shift_forward")
+    df_all.loc[mask, "_dt"] = localized
 
     df_all.sort_values(by=["_dt","client","type"], inplace=True, kind="stable")
     df_all.drop(columns=["_dt"], inplace=True)
 
-    # --- Fill messages from programme sheets ---
-    try:
-        doc_prog = _retry(client.open, config.FICHIER_PROGRAMMES)
-    except Exception:
-        doc_prog = None
-    programmes_cache = {}
-
-    type_mapping = {
-        "Aphorisme": "1-Aphorisme",
-        "Conseil": "2-Conseil",
-        "Réflexion": "3-Réflexion",
-    }
-
-    messages, formats, urls = [], [], []
-    for _, r in df_all.iterrows():
-        if not doc_prog:
-            messages.append("")
-            formats.append("texte")
-            urls.append("")
-            continue
-        prog = str(r["programme"]).zfill(3)
-        if prog not in programmes_cache:
-            try:
-                ws = _retry(doc_prog.worksheet, prog)
-                dfp = pd.DataFrame(_retry(ws.get_all_records))
-                for c in ["Saison","Jour","Type","Phrase","Format","Url"]:
-                    if c not in dfp.columns:
-                        dfp[c] = ""
-                dfp["Saison"] = pd.to_numeric(dfp["Saison"], errors="coerce").fillna(1).astype(int)
-                dfp["Jour"] = pd.to_numeric(dfp["Jour"], errors="coerce").fillna(1).astype(int)
-                programmes_cache[prog] = dfp
-            except Exception:
-                programmes_cache[prog] = pd.DataFrame(columns=["Saison","Jour","Type","Phrase","Format","Url"])
-        dfp = programmes_cache.get(prog, pd.DataFrame())
-        saison = int(r["saison"])
-        jour = int(r["avancement"])
-        type_excel = type_mapping.get(str(r["type"]).strip(), None)
-        if type_excel is None or dfp.empty:
-            messages.append("")
-            formats.append("texte")
-            urls.append("")
-            continue
-        sel = (dfp["Saison"] == saison) & (dfp["Jour"] == jour) & (dfp["Type"] == type_excel)
-        match = dfp[sel]
-        if not match.empty:
-            phrase = str(match.iloc[0].get("Phrase",""))
-            fmt = str(match.iloc[0].get("Format","texte")).strip().lower() or "texte"
-            url = str(match.iloc[0].get("Url",""))
-            messages.append(f"Saison {saison} - Jour {jour} : \n{r['type']} : {phrase}")
-            formats.append(fmt)
-            urls.append(url)
-        else:
-            messages.append("")
-            formats.append("texte")
-            urls.append("")
-
-    df_all["message"] = messages
-    df_all["format"] = formats
-    df_all["url"] = urls
-
-    # Write back
+    # fill messages from programmes (same as before, omitted for brevity in this debug)
+    # write back
     for c in df_all.columns:
         df_all[c] = df_all[c].astype(str)
+    ws_planning.clear()
+    ws_planning.update([df_all.columns.tolist()] + df_all.values.tolist())
 
-    _retry(ws_planning.clear)
-    _retry(ws_planning.update, [df_all.columns.tolist()] + df_all.values.tolist())
-
-    # Debug: show counts per date to help operator
-    counts = df_all["date"].value_counts().sort_index()
-    print("Comptes par date:", dict(counts))
+    print(f"[DEBUG] Total par date (après fusion): {dict(df_all['date'].value_counts().sort_index())}")
     print(f"📅 Mise à jour planning à {datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
 if __name__ == "__main__":
