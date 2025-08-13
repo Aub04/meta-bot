@@ -1,8 +1,10 @@
-datetime
-google-auth
-gspread
-oauth2client
-pandas
-pytz
-requests
-times
+# Core
+gspread==6.1.2
+google-auth==2.31.0
+
+# Data + TZ
+pandas==2.2.2
+pytz==2024.1
+
+# HTTP
+requests==2.32.3
