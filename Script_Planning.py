@@ -134,7 +134,7 @@ def generer_planning():
                 tid = int(pd.to_numeric(r.get("Id",""), errors="coerce"))
             except Exception:
                 continue
-            lbl = str(r.get("Type",""))..strip()
+            lbl = str(r.get("Type","")).strip()
             if lbl:
                 types_id_to_label[tid] = lbl
                 types_label_to_id[lbl.lower()] = tid
