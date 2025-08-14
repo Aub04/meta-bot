@@ -284,7 +284,8 @@ def generer_planning():
         rec = subset.iloc[k-1] if len(subset) >= k else None
 
         if rec is not None and pd.notna(rec.get("Phrase","")) and str(rec.get("Phrase","")) != "":
-            type_id = int(pd.to_numeric(rec.get("Type"), errors="coerce") or 0)
+            val = pd.to_numeric(rec.get("Type"), errors="coerce")
+            type_id = int(val) if pd.notna(val) else 0
             label = types_id_to_label.get(type_id, str(type_id))
             labels.append(label)
             messages.append(f"Saison {saison} - Jour {jour} : \n{label} : {rec.get('Phrase','')}")
