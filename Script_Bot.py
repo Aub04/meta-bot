@@ -149,15 +149,20 @@ def lancer_bot():
     now_local = datetime.now(tz)
 
     # Filter candidates: envoye == "non" and datetime <= now (optionally within window)
-    elig = (df["envoye"].str.lower() == "non") & df["_dt"].notna() & (df["_dt"] <= now_local)
+    has_msg = df["message"].astype(str).str.strip() != ""
+    
+    elig = (
+        (df["envoye"].str.lower() == "non")
+        & df["_dt"].notna()
+        & (df["_dt"] <= now_local)
+        & has_msg             # <<--- AJOUT
+    )
+    
     if SEND_WINDOW_MINUTES is not None:
         window_start = now_local - timedelta(minutes=int(SEND_WINDOW_MINUTES))
         elig = elig & (df["_dt"] >= window_start)
-
+    
     df_send = df[elig].copy()
-    if df_send.empty:
-        print("Rien à envoyer.")
-        return
 
     # Column indices (1-based) for A1 ranges
     col_map = {name: (i+1) for i, name in enumerate(header)}
@@ -173,27 +178,28 @@ def lancer_bot():
         ws_row_num = int(idx) + 2
 
         chat_id = row["chat_id"]
-        text = str(row["message"]).strip()
+        raw_text = str(row["message"]).strip()  # on teste le "message" du planning, pas le texte après append url
         fmt = str(row["format"]).strip().lower()
         url = str(row["url"]).strip()
-
-        success = False
-        err = None
-
+        
+        # Ne rien envoyer si message vide
+        if not raw_text:
+            print(f"⏭️ Skip (message vide) ligne {ws_row_num} -> chat_id={chat_id}")
+            continue
+        
         try:
             if fmt == "image" and url:
-                success, err = send_telegram_photo(chat_id, url, caption=text if text else None)
+                success, err = send_telegram_photo(chat_id, url, caption=raw_text)
             else:
-                # append url if provided and not image
+                text = raw_text
+                # si tu veux garder l'ajout du lien quand ce n'est pas une image :
                 if url:
-                    if text:
-                        text = f"{text}\\n{url}"
-                    else:
-                        text = url
-                success, err = send_telegram_message(chat_id, text if text else "(message vide)")
+                    text = f"{text}\n{url}"
+                success, err = send_telegram_message(chat_id, text)
         except Exception as e:
             success = False
             err = f"exception:{e}"
+
 
         if success:
             updates.append((ws_row_num, "oui"))
