@@ -42,7 +42,7 @@ def _norm_hms(x):
 
 def _norm_date(s):
     # Accept a variety of inputs; output YYYY-MM-DD
-    dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
+    dt = pd.to_datetime(s, errors="coerce", format="%Y-%m-%d")
     return "" if pd.isna(dt) else dt.strftime("%Y-%m-%d")
 
 def _norm_chat(s):
