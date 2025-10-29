@@ -1,38 +1,38 @@
-name: Planning Cron
+# name: Planning Cron
 
 
-on:
-  schedule:
-    - cron: '0 7 * * *'    # Toutes les heures à la minute 11 (adapte si besoin)
-  workflow_dispatch:         # Permet de lancer à la main depuis GitHub
+# on:
+#   schedule:
+#     - cron: '0 7 * * *'    # Toutes les heures à la minute 11 (adapte si besoin)
+#   workflow_dispatch:         # Permet de lancer à la main depuis GitHub
 
-jobs:
-  run-bot:
-    runs-on: ubuntu-latest
+# jobs:
+#   run-bot:
+#     runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+#     steps:
+#       - name: Checkout code
+#         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'   # Ou la version que tu veux
+#       - name: Set up Python
+#         uses: actions/setup-python@v5
+#         with:
+#           python-version: '3.11'   # Ou la version que tu veux
 
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
+#       - name: Install dependencies
+#         run: |
+#           pip install -r requirements.txt
 
-      - name: Write Google credentials (base64)
-        run: echo "${{ secrets.GOOGLE_CREDENTIALS_B64 }}" | base64 -d > credentials.json
+#       - name: Write Google credentials (base64)
+#         run: echo "${{ secrets.GOOGLE_CREDENTIALS_B64 }}" | base64 -d > credentials.json
         
-      - name: Run Script_Planning
-        env:
-          FICHIER_PLANNING: ${{ secrets.FICHIER_PLANNING }}
-          FICHIER_PROGRAMMES: ${{ secrets.FICHIER_PROGRAMMES }}
-          FICHIER_CLIENTS: ${{ secrets.FICHIER_CLIENTS }}
-          FEUILLE_PLANNING: ${{ secrets.FEUILLE_PLANNING }}
-          FEUILLE_CLIENTS: ${{ secrets.FEUILLE_CLIENTS }}
-          CHEMIN_CLE_JSON: credentials.json
-        run: |
-          python Script_Planning.py
+#       - name: Run Script_Planning
+#         env:
+#           FICHIER_PLANNING: ${{ secrets.FICHIER_PLANNING }}
+#           FICHIER_PROGRAMMES: ${{ secrets.FICHIER_PROGRAMMES }}
+#           FICHIER_CLIENTS: ${{ secrets.FICHIER_CLIENTS }}
+#           FEUILLE_PLANNING: ${{ secrets.FEUILLE_PLANNING }}
+#           FEUILLE_CLIENTS: ${{ secrets.FEUILLE_CLIENTS }}
+#           CHEMIN_CLE_JSON: credentials.json
+#         run: |
+#           python Script_Planning.py
